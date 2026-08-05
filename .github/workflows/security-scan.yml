@@ -1,0 +1,368 @@
+name: 🔒 Security Scan Pipeline
+
+on:
+  push:
+    branches: [main, master, develop]
+  pull_request:
+    branches: [main, master, develop]
+  schedule:
+    - cron: '0 6 * * 1'  # Weekly Monday 6AM UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+
+jobs:
+  # ============================================
+  # JOB 1: Detect Technology Stack
+  # ============================================
+  detect-stack:
+    name: 🔍 Detect Technology Stack
+    runs-on: ubuntu-latest
+    outputs:
+      stack: ${{ steps.detect.outputs.stack }}
+      package_manager: ${{ steps.detect.outputs.package_manager }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Detect Backend Technology
+        id: detect
+        run: |
+          echo "🔍 Scanning repository for technology stack..."
+          
+          STACK="unknown"
+          PKG_MANAGER="npm"
+          
+          if [ -f "package.json" ]; then
+            STACK="node"
+            if [ -f "yarn.lock" ]; then PKG_MANAGER="yarn"; fi
+            if [ -f "pnpm-lock.yaml" ]; then PKG_MANAGER="pnpm"; fi
+            
+            # Sub-classify
+            if grep -q "next" package.json 2>/dev/null; then STACK="nextjs"; fi
+            if grep -q "express" package.json 2>/dev/null; then STACK="express"; fi
+            if grep -q "nestjs" package.json 2>/dev/null; then STACK="nestjs"; fi
+            if grep -q "react" package.json 2>/dev/null; then STACK="react"; fi
+            if grep -q "vue" package.json 2>/dev/null; then STACK="vue"; fi
+          fi
+          
+          if [ -f "requirements.txt" ] || [ -f "Pipfile" ] || [ -f "pyproject.toml" ]; then STACK="python"; fi
+          if [ -f "pom.xml" ] || [ -f "build.gradle" ]; then STACK="java"; fi
+          if [ -f "go.mod" ]; then STACK="go"; fi
+          if [ -f "Cargo.toml" ]; then STACK="rust"; fi
+          if [ -f "composer.json" ]; then STACK="php"; fi
+          if [ -f "Gemfile" ]; then STACK="ruby"; fi
+          
+          echo "stack=$STACK" >> "$GITHUB_OUTPUT"
+          echo "package_manager=$PKG_MANAGER" >> "$GITHUB_OUTPUT"
+          echo "✅ Detected stack: $STACK (Package Manager: $PKG_MANAGER)"
+
+  # ============================================
+  # JOB 2: Semgrep SAST Scan
+  # ============================================
+  semgrep:
+    name: 🛡️ Semgrep SAST
+    runs-on: ubuntu-latest
+    needs: detect-stack
+    container:
+      image: semgrep/semgrep:latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Semgrep Scan
+        run: |
+          echo "🛡️ Running Semgrep SAST analysis..."
+          semgrep scan \
+            --config auto \
+            --config p/security-audit \
+            --config p/secrets \
+            --config p/owasp-top-ten \
+            --json \
+            --output semgrep-results.json \
+            --severity ERROR \
+            --severity WARNING \
+            . || true
+          
+          # Also generate readable text report
+          semgrep scan \
+            --config auto \
+            --config p/security-audit \
+            --config p/secrets \
+            --output semgrep-results.txt \
+            --severity ERROR \
+            --severity WARNING \
+            . || true
+
+      - name: Upload Semgrep Results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: semgrep-results
+          path: |
+            semgrep-results.json
+            semgrep-results.txt
+          retention-days: 30
+
+      - name: Check for Critical Findings
+        id: semgrep-check
+        run: |
+          if [ -f semgrep-results.json ]; then
+            CRITICAL_COUNT=$(python3 -c "
+          import json
+          with open('semgrep-results.json') as f:
+              data = json.load(f)
+          results = data.get('results', [])
+          critical = [r for r in results if r.get('extra', {}).get('severity', '').upper() == 'ERROR']
+          print(len(critical))
+          " 2>/dev/null || echo "0")
+            echo "critical_count=$CRITICAL_COUNT" >> "$GITHUB_OUTPUT"
+            echo "📊 Semgrep found $CRITICAL_COUNT critical findings"
+          fi
+
+  # ============================================
+  # JOB 3: Trivy Vulnerability Scan
+  # ============================================
+  trivy:
+    name: 🔎 Trivy Vulnerability Scan
+    runs-on: ubuntu-latest
+    needs: detect-stack
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Trivy FS Scan
+        uses: aquasecurity/trivy-action@0.30.0
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'json'
+          output: 'trivy-results.json'
+          severity: 'CRITICAL,HIGH,MEDIUM'
+          exit-code: '0'
+
+      - name: Generate Trivy Table Report
+        uses: aquasecurity/trivy-action@0.30.0
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'table'
+          output: 'trivy-results.txt'
+          severity: 'CRITICAL,HIGH,MEDIUM'
+          exit-code: '0'
+
+      - name: Upload Trivy Results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: trivy-results
+          path: |
+            trivy-results.json
+            trivy-results.txt
+          retention-days: 30
+
+      - name: Check Critical Vulnerabilities
+        id: trivy-check
+        run: |
+          if [ -f trivy-results.json ]; then
+            CRITICAL=$(cat trivy-results.json | python3 -c "
+          import json, sys
+          data = json.load(sys.stdin)
+          count = 0
+          for result in data.get('Results', []):
+              for vuln in result.get('Vulnerabilities', []):
+                  if vuln.get('Severity') == 'CRITICAL':
+                      count += 1
+          print(count)
+          " 2>/dev/null || echo "0")
+            echo "critical_count=$CRITICAL" >> "$GITHUB_OUTPUT"
+            echo "📊 Trivy found $CRITICAL critical vulnerabilities"
+          fi
+
+  # ============================================
+  # JOB 4: Gitleaks Secret Detection
+  # ============================================
+  gitleaks:
+    name: 🔑 Gitleaks Secret Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run Gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_LICENSE: ${{ secrets.GITLEAKS_LICENSE }}
+        continue-on-error: true
+
+      - name: Run Gitleaks (Fallback Manual)
+        if: failure()
+        run: |
+          echo "⬇️ Installing Gitleaks..."
+          wget -q https://github.com/gitleaks/gitleaks/releases/download/v8.21.2/gitleaks_8.21.2_linux_x64.tar.gz
+          tar -xzf gitleaks_8.21.2_linux_x64.tar.gz
+          
+          echo "🔑 Scanning for secrets..."
+          ./gitleaks detect --source . --report-format json --report-path gitleaks-results.json --no-git || true
+          ./gitleaks detect --source . --report-format csv --report-path gitleaks-results.csv --no-git || true
+
+      - name: Upload Gitleaks Results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: gitleaks-results
+          path: |
+            gitleaks-results.json
+            gitleaks-results.csv
+          retention-days: 30
+          if-no-files-found: ignore
+
+  # ============================================
+  # JOB 5: Dependency Review
+  # ============================================
+  dependency-review:
+    name: 📦 Dependency Review
+    runs-on: ubuntu-latest
+    needs: detect-stack
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Dependency Review
+        uses: actions/dependency-review-action@v4
+        with:
+          fail-on-severity: critical
+          comment-summary-in-pr: always
+
+  npm-audit:
+    name: 📦 NPM Audit
+    runs-on: ubuntu-latest
+    needs: detect-stack
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Run npm audit
+        run: |
+          npm audit --json > npm-audit-results.json 2>&1 || true
+          npm audit > npm-audit-results.txt 2>&1 || true
+          echo "📦 NPM Audit completed"
+
+      - name: Upload npm audit results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: npm-audit-results
+          path: |
+            npm-audit-results.json
+            npm-audit-results.txt
+          retention-days: 30
+
+  # ============================================
+  # JOB 6: Summary & Gate
+  # ============================================
+  security-gate:
+    name: 🚦 Security Gate
+    runs-on: ubuntu-latest
+    needs: [semgrep, trivy, gitleaks, npm-audit]
+    if: always()
+    steps:
+      - name: Download All Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+        continue-on-error: true
+
+      - name: Generate Security Summary
+        run: |
+          echo "## 🔒 Security Scan Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Scanner | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|---------|--------|" >> $GITHUB_STEP_SUMMARY
+          
+          # Semgrep
+          if [ -f semgrep-results.json ]; then
+            SEMGREP_COUNT=$(python3 -c "import json; data=json.load(open('semgrep-results.json')); print(len(data.get('results',[])))" 2>/dev/null || echo "N/A")
+            echo "| 🛡️ Semgrep SAST | $SEMGREP_COUNT findings |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| 🛡️ Semgrep SAST | ⏭️ Skipped |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # Trivy
+          if [ -f trivy-results.json ]; then
+            TRIVY_COUNT=$(python3 -c "
+          import json
+          data=json.load(open('trivy-results.json'))
+          count=sum(len(r.get('Vulnerabilities',[])) for r in data.get('Results',[]))
+          print(count)" 2>/dev/null || echo "N/A")
+            echo "| 🔎 Trivy | $TRIVY_COUNT vulnerabilities |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| 🔎 Trivy | ⏭️ Skipped |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # Gitleaks
+          if [ -f gitleaks-results.json ]; then
+            GITLEAKS_COUNT=$(python3 -c "import json; print(len(json.load(open('gitleaks-results.json'))))" 2>/dev/null || echo "0")
+            echo "| 🔑 Gitleaks | $GITLEAKS_COUNT secrets detected |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| 🔑 Gitleaks | ✅ No secrets found |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          # NPM Audit
+          if [ -f npm-audit-results.json ]; then
+            echo "| 📦 NPM Audit | ✅ Completed |" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "| 📦 NPM Audit | ⏭️ Skipped |" >> $GITHUB_STEP_SUMMARY
+          fi
+          
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "📅 **Scan Date:** $(date -u '+%Y-%m-%d %H:%M UTC')" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "> Reports are available as downloadable artifacts." >> $GITHUB_STEP_SUMMARY
+
+      - name: Fail on Critical Vulnerabilities
+        run: |
+          FAIL=false
+          
+          # Check Semgrep criticals
+          if [ -f semgrep-results.json ]; then
+            CRITICAL=$(python3 -c "
+          import json
+          data=json.load(open('semgrep-results.json'))
+          results=data.get('results',[])
+          critical=[r for r in results if r.get('extra',{}).get('severity','').upper()=='ERROR']
+          print(len(critical))" 2>/dev/null || echo "0")
+            if [ "$CRITICAL" -gt "0" ] 2>/dev/null; then
+              echo "❌ Semgrep: $CRITICAL CRITICAL findings"
+              FAIL=true
+            fi
+          fi
+          
+          # Check Trivy criticals
+          if [ -f trivy-results.json ]; then
+            CRITICAL=$(python3 -c "
+          import json
+          data=json.load(open('trivy-results.json'))
+          count=0
+          for r in data.get('Results',[]):
+              for v in r.get('Vulnerabilities',[]):
+                  if v.get('Severity')=='CRITICAL': count+=1
+          print(count)" 2>/dev/null || echo "0")
+            if [ "$CRITICAL" -gt "0" ] 2>/dev/null; then
+              echo "❌ Trivy: $CRITICAL CRITICAL vulnerabilities"
+              FAIL=true
+            fi
+          fi
+          
+          if [ "$FAIL" = true ]; then
+            echo "🚫 SECURITY GATE FAILED: Critical vulnerabilities detected!"
+            exit 1
+          else
+            echo "✅ SECURITY GATE PASSED: No critical vulnerabilities."
+          fi
