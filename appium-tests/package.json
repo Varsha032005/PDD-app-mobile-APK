@@ -1,0 +1,16 @@
+{
+  "name": "appium-mobile-tests",
+  "version": "1.0.0",
+  "description": "Appium E2E automation test suite for mobile app frontend with 400+ test cases report",
+  "main": "tests/app-tests.js",
+  "type": "module",
+  "scripts": {
+    "test": "node tests/app-tests.js",
+    "generate-report": "node generate_report.js"
+  },
+  "dependencies": {
+    "appium": "^2.11.0",
+    "exceljs": "^4.4.0",
+    "webdriverio": "^8.38.0"
+  }
+}
